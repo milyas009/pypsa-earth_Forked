@@ -805,7 +805,6 @@ if config["monte_carlo"]["options"].get("add_to_snakefile", False) == False:
         input:
             overrides=BASE_DIR + "/data/override_component_attrs",
             network="networks/" + RDIR + "elec_s{simpl}_{clusters}_ec_l{ll}_{opts}.nc",
-            agg_p_nom_minmax=config["electricity"]["agg_p_nom_limits"]["file"],  # ensure the CSV with capacity constraints is copied into the shadow directory (needed on Windows, since shadowed scripts can’t access files outside `input`)
         output:
             "results/" + RDIR + "networks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}.nc",
         log:
@@ -876,7 +875,6 @@ if config["monte_carlo"]["options"].get("add_to_snakefile", False) == True:
             network="networks/"
             + RDIR
             + "elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{unc}.nc",
-            agg_p_nom_minmax=config["electricity"]["agg_p_nom_limits"]["file"],  # ensure the CSV with capacity constraints is copied into the shadow directory (needed on Windows, since shadowed scripts can’t access files outside `input`)
         output:
             "results/"
             + RDIR
@@ -1658,7 +1656,6 @@ if config["foresight"] == "overnight":
             + "prenetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
             configs=SDIR + "configs/config.yaml",  # included to trigger copy_config rule
-            agg_p_nom_minmax=config["electricity"]["agg_p_nom_limits"]["file"],  # ensure the CSV with capacity constraints is copied into the shadow directory (needed on Windows, since shadowed scripts can’t access files outside `input`)
         output:
             RESDIR
             + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
@@ -2131,7 +2128,6 @@ if config["foresight"] == "myopic":
             + "prenetworks-brownfield/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",
             costs="resources/" + RDIR + "costs_{planning_horizons}.csv",
             configs=SDIR + "configs/config.yaml",  # included to trigger copy_config rule
-            agg_p_nom_minmax=config["electricity"]["agg_p_nom_limits"]["file"],  # ensure the CSV with capacity constraints is copied into the shadow directory (needed on Windows, since shadowed scripts can’t access files outside `input`)
         output:
             network=RESDIR
             + "postnetworks/elec_s{simpl}_{clusters}_ec_l{ll}_{opts}_{sopts}_{planning_horizons}_{discountrate}_{demand}_{h2export}export.nc",

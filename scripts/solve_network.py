@@ -86,7 +86,7 @@ import numpy as np
 import pandas as pd
 import pypsa
 import xarray as xr
-from _helpers import configure_logging, create_logger, override_component_attrs
+from _helpers import BASE_DIR, configure_logging, create_logger, override_component_attrs
 from linopy import merge
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 from pypsa.optimization.abstract import optimize_transmission_expansion_iteratively
@@ -196,101 +196,226 @@ def add_CCL_constraints(n, config):
     Add minimum and maximum levels of generator nominal capacity per carrier
     for individual countries. Opts and path for agg_p_nom_minmax.csv must be defined
     in config.yaml. Default file is available at data/agg_p_nom_minmax.csv.
-    Parameter include_existing in config.yaml decides whether existing capacities
-    are considered in the CCL constraints. Default is false.
+
+    The CSV file must have a MultiIndex with (country, carrier) as the first two
+    levels, and must contain 'min' and 'max' columns with capacity limits in MW.
 
     Parameters
     ----------
     n : pypsa.Network
+        Network to add constraints to
     config : dict
+        Configuration dictionary containing electricity.agg_p_nom_limits path
 
     Example
     -------
     scenario:
-        opts: [CCL-Co2L-24H]
+        opts: [Co2L-CCL-24H]
     electricity:
-        agg_p_nom_limits:
-            file: data/agg_p_nom_minmax.csv
-            include_existing: false
+        agg_p_nom_limits: data/agg_p_nom_minmax.csv
+        ccl_include_existing: true # default false
+
+    CSV Format:
+        country,carrier,min,max
+        TH,solar,3174.0,37400.0
+        TH,onwind,1536.75,9400.0
+        ...
+
+    Notes
+    -----
+    - Only extendable generators with carriers matching the CSV are constrained
+    - Only countries present in both network and CSV are included
+    - Generators with missing country information are excluded with a warning
     """
     agg_p_nom_limits = config["electricity"].get("agg_p_nom_limits")
 
-    try:
-        agg_p_nom_minmax = pd.read_csv(
-            snakemake.input.agg_p_nom_minmax, index_col=list(range(2)), header=[0, 1]
-        )[snakemake.wildcards.planning_horizons]
-    except IOError:
-        logger.exception(
+    if agg_p_nom_limits is None:
+        raise ValueError(
             "Need to specify the path to a .csv file containing "
             "aggregate capacity limits per country in "
-            "config['electricity']['agg_p_nom_limit']."
+            "config['electricity']['agg_p_nom_limits']."
         )
+
+    # Resolve path relative to project root if needed
+    agg_p_nom_limits_path = Path(agg_p_nom_limits)
+    if not agg_p_nom_limits_path.is_absolute():
+        # Try relative to current directory first, then relative to project root
+        if not agg_p_nom_limits_path.exists():
+            agg_p_nom_limits_path = Path(BASE_DIR) / agg_p_nom_limits
+
+    try:
+        agg_p_nom_minmax = pd.read_csv(agg_p_nom_limits_path, index_col=list(range(2)))
+    except (IOError, FileNotFoundError) as e:
+        logger.exception(
+            f"Failed to read aggregate capacity limits file: {agg_p_nom_limits_path}. "
+            "Need to specify the path to a .csv file containing "
+            "aggregate capacity limits per country in "
+            "config['electricity']['agg_p_nom_limits']."
+        )
+        raise
+
+    # Validate CSV structure: must have 'min' and 'max' columns with MultiIndex (country, carrier)
+    if not isinstance(agg_p_nom_minmax.index, pd.MultiIndex):
+        raise ValueError(
+            "CSV file must have MultiIndex with country and carrier as first two levels. "
+            f"Found index type: {type(agg_p_nom_minmax.index)}"
+        )
+    if agg_p_nom_minmax.index.nlevels < 2:
+        raise ValueError(
+            "CSV file must have at least 2 index levels (country, carrier). "
+            f"Found {agg_p_nom_minmax.index.nlevels} levels."
+        )
+    required_columns = ["min", "max"]
+    missing_columns = [col for col in required_columns if col not in agg_p_nom_minmax.columns]
+    if missing_columns:
+        raise ValueError(
+            f"CSV file must contain columns: {required_columns}. "
+            f"Missing columns: {missing_columns}"
+        )
+
     logger.info(
-        "Adding per carrier generation capacity constraints for " "individual countries"
+        "Adding per carrier generation capacity constraints for individual countries"
     )
 
     capacity_variable = n.model["Generator-p_nom"]
 
-    # get carriers to which CCL constraints apply
-    ccl_carriers = agg_p_nom_minmax.index.get_level_values(1).unique()
+    # Get carriers from network and CSV, use intersection
     ext_carriers = n.generators.query("p_nom_extendable").carrier.unique()
-    ccl_carriers = ccl_carriers[ccl_carriers.isin(ext_carriers)]
+    csv_carriers = agg_p_nom_minmax.index.get_level_values(1).unique()
+    common_carriers = pd.Index(ext_carriers).intersection(csv_carriers)
 
-    # If no CCL carriers found, return early
-    if not ccl_carriers.any():
-        logger.info(
-            "No CCL carriers found that are extendable. Skipping CCL constraints."
+    if len(common_carriers) == 0:
+        logger.warning(
+            "No common carriers found between network and CSV file. "
+            "Skipping CCL constraints."
         )
         return
 
-    # Get extendable generators for relevant carriers
-    gens = n.generators[n.generators.carrier.isin(ccl_carriers)]
-    gens = gens.rename_axis(index="Generator-ext")
+    # Build capacity expressions per carrier grouped by country
+    lhs_per_carrier = {}
+    for carrier in common_carriers:
+        ext_generators = n.generators.query(
+            "p_nom_extendable and carrier == @carrier"
+        )
+        if len(ext_generators) == 0:
+            continue
 
-    # Prepare country and carrier grouper
-    grouper = pd.concat(
-        [gens.bus.map(n.buses.country).rename("country"), gens.carrier], axis=1
-    )
+        # Map generator buses to countries
+        bus_countries = ext_generators.bus.map(n.buses.country)
+        # Check if any generators have missing country information
+        if bus_countries.isna().any():
+            missing_buses = ext_generators.index[bus_countries.isna()]
+            logger.warning(
+                f"Generators {list(missing_buses)} for carrier '{carrier}' "
+                "have missing country information. They will be excluded from constraints."
+            )
+            bus_countries = bus_countries.dropna()
 
-    # Prepare LHS
-    lhs = capacity_variable.groupby(grouper).sum()
+        if len(bus_countries) == 0:
+            continue
 
-    # Obtain existing capacities
-    existing_capacities = gens.p_nom.groupby(
-        [grouper["country"], grouper["carrier"]]
-    ).sum()
+        country_grouper = (
+            bus_countries.rename_axis("Generator-ext").rename("country")
+        )
+        capacity_per_country = (
+            capacity_variable.loc[country_grouper.index]
+            .groupby(country_grouper.to_xarray())
+            .sum()
+        )
+        lhs_per_carrier[carrier] = capacity_per_country
 
-    # Obtain minimum and maximum constraint limits
-    min_values = agg_p_nom_minmax["min"]
-    max_values = agg_p_nom_minmax["max"]
+    if len(lhs_per_carrier) == 0:
+        logger.warning("No extendable generators found. Skipping CCL constraints.")
+        return
+
+    # Extract country coordinates from all expressions and find common set
+    # Different carriers might have generators in different countries
+    all_countries = set()
+    for expr in lhs_per_carrier.values():
+        all_countries.update(expr.coords["country"].values)
+    country_coords = pd.Index(sorted(all_countries))
+
+    # Merge expressions along carrier dimension in consistent order
+    # CRITICAL: Maintain the same order for carriers_in_network later
+    # The merge function creates carrier dimension with integer indices [0, 1, 2, ...]
+    carriers_for_merge = [c for c in common_carriers if c in lhs_per_carrier]
+    lhs_list = [lhs_per_carrier[c] for c in carriers_for_merge]
+    lhs = merge(lhs_list, dim="carrier")
+
+    # Get countries that exist in both network and CSV
+    csv_countries = agg_p_nom_minmax.index.get_level_values(0).unique()
+    network_countries = pd.Index(country_coords)
+    common_countries = network_countries.intersection(csv_countries)
+
+    if len(common_countries) == 0:
+        logger.warning(
+            "No common countries found between network and CSV file. "
+            "Skipping CCL constraints."
+        )
+        return
+
+    # Convert CSV data to xarray and align with network structure
+    min_matrix_raw = agg_p_nom_minmax["min"].to_xarray().unstack()
+    max_matrix_raw = agg_p_nom_minmax["max"].to_xarray().unstack()
 
     # Adjust limits if existing capacities are considered
-    if agg_p_nom_limits.get("include_existing", False):
-        min_values = (min_values - existing_capacities).clip(lower=0)
-        max_values = (max_values - existing_capacities).clip(lower=0)
-        logger.info(
-            f"Considered existing capacities in CCL constraints for carrier {c}."
-        )
+    if config["electricity"].get("ccl_include_existing", False):
+        logger.info("Considering existing capacities in CCL constraints.")
+        
+        # Group existing (non-extendable) capacities by country and carrier
+        existing_gens = n.generators.query("not p_nom_extendable and carrier in @common_carriers")
+        
+        if not existing_gens.empty:
+            existing_capacities = (
+                existing_gens.groupby([existing_gens.bus.map(n.buses.country), "carrier"])
+                .p_nom.sum()
+            )
+            
+            # Convert to xarray to subtract from limits
+            existing_caps_xr = existing_capacities.to_xarray().unstack()
+            
+            # Reindex to match the structure of the limits matrices
+            existing_caps_aligned = existing_caps_xr.reindex(
+                country=min_matrix_raw.coords["country"].values,
+                carrier=min_matrix_raw.coords["carrier"].values,
+                fill_value=0
+            )
+            
+            min_matrix_raw = (min_matrix_raw - existing_caps_aligned).clip(min=0)
+            max_matrix_raw = (max_matrix_raw - existing_caps_aligned).clip(min=0)
 
-    # Convert limits to xarray for masking
-    min_values = xr.DataArray(min_values.dropna()).rename(dim_0="group")
-    max_values = xr.DataArray(max_values.dropna()).rename(dim_0="group")
+    # Reindex matrices with carrier names first to get correct data mapping
+    # CRITICAL: Use carriers_for_merge to ensure order matches lhs merge order
+    # Then remap carrier dimension to integer indices to match lhs structure
+    min_matrix_by_name = min_matrix_raw.reindex(
+        country=list(country_coords),
+        carrier=carriers_for_merge,
+        fill_value=np.nan,
+    )
+    max_matrix_by_name = max_matrix_raw.reindex(
+        country=list(country_coords),
+        carrier=carriers_for_merge,
+        fill_value=np.nan,
+    )
 
-    # Valid constraints
-    valid_min_index = min_values.indexes["group"].intersection(lhs.indexes["group"])
-    valid_max_index = max_values.indexes["group"].intersection(lhs.indexes["group"])
+    # Remap carrier dimension to integer indices to match merge output
+    # The merge function creates carrier dimension with integer indices [0, 1, 2, ...]
+    # This order must match carriers_for_merge order exactly
+    carrier_indices = np.arange(len(carriers_for_merge))
+    min_matrix = min_matrix_by_name.assign_coords(carrier=("carrier", carrier_indices))
+    max_matrix = max_matrix_by_name.assign_coords(carrier=("carrier", carrier_indices))
 
-    if not valid_min_index.empty:
-        n.model.add_constraints(
-            lhs.sel(group=valid_min_index) >= min_values.loc[valid_min_index],
-            name="agg_p_nom_min",
-        )
+    # Create masks for valid (non-null) entries
+    min_mask = min_matrix.notnull()
+    max_mask = max_matrix.notnull()
 
-    if not valid_max_index.empty:
-        n.model.add_constraints(
-            lhs.sel(group=valid_max_index) <= max_values.loc[valid_max_index],
-            name="agg_p_nom_max",
-        )
+    # Add constraints with masks to only include valid entries
+    n.model.add_constraints(
+        lhs >= min_matrix, name="agg_p_nom_min", mask=min_mask
+    )
+    n.model.add_constraints(
+        lhs <= max_matrix, name="agg_p_nom_max", mask=max_mask
+    )
 
 
 def add_EQ_constraints(n, o, scaling=1e-1):
@@ -350,7 +475,6 @@ def add_EQ_constraints(n, o, scaling=1e-1):
         spillage_variable = n.model["StorageUnit-spill"]
         lhs_spill = (
             (spillage_variable * (-n.snapshot_weightings.stores * scaling))
-            .groupby_sum(sgrouper)
             .groupby(sgrouper.to_xarray())
             .sum()
             .sum("snapshot")
@@ -989,8 +1113,8 @@ def add_lossy_bidirectional_link_constraints(n: pypsa.components.Network) -> Non
         return pd.Index(
             [
                 (
-                    re.sub(r"-(\d{4})$", r"-reversed-\1", s)
-                    if re.search(r"-\d{4}$", s)
+                    re.sub(r"-(\\d{4})$", r"-reversed-\\1", s)
+                    if re.search(r"-\\d{4}$", s)
                     else s + "-reversed"
                 )
                 for s in forward_i
